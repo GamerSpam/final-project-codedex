@@ -1,16 +1,67 @@
 import discord
 from discord.ext import commands, tasks
 from bottoken import bottoken
-import requests, json
+import requests
+import json
+import random
+
 
 intents = discord.Intents.default()
 intents.message_content = True
 
 inventories = {}
 trades_in_progress = {}
+active_quests = {}
 
 bot = commands.Bot(command_prefix='$', intents=intents)
 
+# Define a structure to hold a quest's details
+class Quest:
+    def __init__(self, initiator, quest_type="solo", members=None):
+        self.initiator = initiator
+        self.quest_type = quest_type
+        self.members = members if members else []
+        self.start_time = discord.utils.utcnow()
+        self.quest_content = None  # This will hold the details of the adventure, combat, or puzzle.
+
+@tasks.loop(seconds=60)
+async def check_trade_timeouts():
+    to_remove = []
+    for user_id, trade in trades_in_progress.items():
+        if trade["status"] == "pending" and (discord.utils.utcnow() - trade["started_at"]).total_seconds() > 300:  # 5 minutes timeout
+            to_remove.append(user_id)
+            trade["status"] = "timeout"
+
+            # Return the escrowed items for the specific trade that timed out
+            escrowed_items_for_user = trade["escrow"].get(user_id, {})
+            for item, quantity in escrowed_items_for_user.items():
+                inventories[user_id].setdefault(item, 0)
+                inventories[user_id][item] += quantity
+
+            escrowed_items_for_partner = trade["escrow"].get(partner_id, {})
+            for item, quantity in escrowed_items_for_partner.items():
+                inventories[partner_id].setdefault(item, 0)
+                inventories[partner_id][item] += quantity
+
+    for user_id in to_remove:
+        trade = trades_in_progress.pop(user_id)
+        partner_id = trade["initiator_id"] if user_id == trade["partner_id"] else trade["partner_id"]
+        trades_in_progress.pop(partner_id, None)
+
+    save_inventories()
+
+@tasks.loop(seconds=30)
+async def check_party_quests():
+    to_remove = []
+    for user_id, quest in active_quests.items():
+        if quest.quest_type == "party":
+            time_elapsed = (discord.utils.utcnow() - quest.start_time).total_seconds()
+            if len(quest.members) >= 4 or time_elapsed >= 240:  # 4 minutes
+                to_remove.append(user_id)
+                # Here you can do something to officially start the quest for the party, e.g. send a message
+                # await ctx.send(f"{quest.initiator}'s party quest has started!")
+    for user_id in to_remove:
+        del active_quests[user_id]
 
 def save_inventories():
     with open("inventories.json", "w") as file:
@@ -27,7 +78,8 @@ def load_inventories():
     # Load inventories
     try:
         with open("inventories.json", "r") as file:
-            inventories = json.load(file)
+            loaded_data = json.load(file)
+            inventories = {int(k): v for k, v in loaded_data.items()}
             print('inventories loaded')
     except FileNotFoundError:
         inventories = {}
@@ -36,7 +88,8 @@ def load_inventories():
     # Load trades in progress
     try:
         with open("trades_in_progress.json", "r") as file:
-            trades_in_progress = json.load(file)
+            loaded_data = json.load(file)
+            trades_in_progress = {int(k): v for k, v in loaded_data.items()}
             print('trades loaded')
     except FileNotFoundError:
         trades_in_progress = {}
@@ -48,6 +101,7 @@ async def on_ready():
     check_trade_timeouts.start()
     print('bot logged in')
     load_inventories()
+    check_party_quests.start()
 
 def get_meme():
   response = requests.get('https://meme-api.com/gimme')
@@ -84,33 +138,6 @@ async def inventory(ctx):
     for item, quantity in inventory.items():
         response += f"{item}: {quantity}\n"
     await ctx.send(response)
-
-
-@tasks.loop(seconds=60)
-async def check_trade_timeouts():
-    to_remove = []
-    for user_id, trade in trades_in_progress.items():
-        if trade["status"] == "pending" and (discord.utils.utcnow() - trade["started_at"]).total_seconds() > 300:  # 5 minutes timeout
-            to_remove.append(user_id)
-            trade["status"] = "timeout"
-
-            # Return the escrowed items for the specific trade that timed out
-            escrowed_items_for_user = trade["escrow"].get(user_id, {})
-            for item, quantity in escrowed_items_for_user.items():
-                inventories[user_id].setdefault(item, 0)
-                inventories[user_id][item] += quantity
-
-            escrowed_items_for_partner = trade["escrow"].get(partner_id, {})
-            for item, quantity in escrowed_items_for_partner.items():
-                inventories[partner_id].setdefault(item, 0)
-                inventories[partner_id][item] += quantity
-
-    for user_id in to_remove:
-        trade = trades_in_progress.pop(user_id)
-        partner_id = trade["initiator_id"] if user_id == trade["partner_id"] else trade["partner_id"]
-        trades_in_progress.pop(partner_id, None)
-
-    save_inventories()
 
 # Command to initiate a trade with another user
 @bot.command()
@@ -212,5 +239,66 @@ def transfer_items(trade):
     del trades_in_progress[trade["partner_id"]]
 
     save_inventories()
+
+# The questing functions are after this
+
+@bot.command()
+async def start_quest(ctx, quest_type="solo"):
+    # Check if the user is already in a quest
+    if ctx.author.id in active_quests:
+        await ctx.send("You're already in a quest!")
+        return
+
+    new_quest = Quest(initiator=ctx.author.id, quest_type=quest_type)
+    active_quests[ctx.author.id] = new_quest
+
+    if quest_type == "solo":
+        await ctx.send(f"{ctx.author.name} has started a solo quest!")
+    else:
+        await ctx.send(f"{ctx.author.name} has started a party quest! Others can join with $join_quest {ctx.author.name}")
+
+@bot.command()
+async def join_quest(ctx, initiator: discord.Member):
+    quest = active_quests.get(initiator.id)
+    if not quest:
+        await ctx.send("That user has not initiated a quest.")
+        return
+
+    if quest.quest_type != "party":
+        await ctx.send("That's a solo quest, you can't join.")
+        return
+
+    if ctx.author.id in quest.members:
+        await ctx.send("You've already joined this quest.")
+        return
+
+    quest.members.append(ctx.author.id)
+    await ctx.send(f"{ctx.author.name} has joined {initiator.name}'s party quest!")
+
+def generate_quest_content():
+    quest_type = random.choice(["adventure", "combat", "puzzle"])
+    content = {}
+
+    if quest_type == "adventure":
+        locations = ["ancient ruins", "a hidden cave", "a mysterious forest", "a deserted village"]
+        content["location"] = random.choice(locations)
+        content["outcome"] = random.choice(["found a treasure chest!", "discovered an old map.", "encountered a strange creature."])
+
+    elif quest_type == "combat":
+        enemies = ["a group of goblins", "a ferocious dragon", "an angry troll", "a cunning thief"]
+        content["enemy"] = random.choice(enemies)
+        content["outcome"] = random.choice(["defeated the enemy!", "were defeated.", "managed to escape."])
+
+    elif quest_type == "puzzle":
+        riddles = [
+            {"question": "What comes once in a minute, twice in a moment, but never in a thousand years?", "answer": "m"},
+            {"question": "The more you take, the more you leave behind. What am I?", "answer": "steps"},
+            # Add more riddles if desired
+        ]
+        chosen_riddle = random.choice(riddles)
+        content["riddle"] = chosen_riddle["question"]
+        content["answer"] = chosen_riddle["answer"]
+
+    return quest_type, content
 
 bot.run(bottoken.id)
